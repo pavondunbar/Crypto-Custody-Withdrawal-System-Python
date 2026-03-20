@@ -32,7 +32,7 @@ This system is built around three tightly integrated components:
 |---|---|---|
 | Withdrawal Service | `withdrawal.py` | Orchestrates the full withdrawal lifecycle |
 | Database Schema & Demo | `withdrawal.sql` | PostgreSQL schema, indexes, and runnable walkthrough |
-| Outbox Publisher | `outbox_publisher.py` | Reliably delivers database events to Kafka |
+| Outbox Publisher | `outbox-publisher.py` | Reliably delivers database events to Kafka |
 
 ---
 
@@ -136,6 +136,8 @@ Tracks user balances with a two-field balance model:
 | `asset` | VARCHAR(10) | e.g. `ETH`, `BTC` |
 | `balance` | DECIMAL(38,18) | Total balance |
 | `locked_balance` | DECIMAL(38,18) | Reserved-but-not-yet-sent funds |
+| `created_at` | TIMESTAMP | Row creation time |
+| `updated_at` | TIMESTAMP | Last modification time |
 
 > **Available balance** = `balance - locked_balance`
 
@@ -145,9 +147,16 @@ Full lifecycle record for every withdrawal:
 | Column | Type | Description |
 |---|---|---|
 | `id` | UUID | Primary key |
+| `account_id` | UUID | Foreign key to `accounts` |
+| `type` | VARCHAR(20) | Transaction type (e.g. `withdrawal`) |
+| `amount` | DECIMAL(38,18) | Withdrawal amount |
 | `status` | VARCHAR(20) | State machine value |
-| `idempotency_key` | VARCHAR(256) UNIQUE | Deduplication key |
+| `destination_address` | VARCHAR(256) | Target crypto address |
 | `tx_hash` | VARCHAR(256) | On-chain transaction hash (set on confirmation) |
+| `block_number` | BIGINT | Block number where the transaction was mined |
+| `idempotency_key` | VARCHAR(256) UNIQUE | Deduplication key |
+| `policy_check_result` | JSONB | Result from policy engine evaluation |
+| `created_at` | TIMESTAMP | Row creation time |
 | `confirmed_at` | TIMESTAMP | NULL = in-flight; NOT NULL = settled |
 
 ### `outbox_events`
@@ -156,8 +165,10 @@ Reliable event delivery buffer:
 | Column | Type | Description |
 |---|---|---|
 | `id` | UUID | Primary key |
+| `aggregate_id` | VARCHAR(256) | Transaction ID (used for Kafka key / ordering) |
 | `event_type` | VARCHAR(64) | e.g. `withdrawal.pending_policy` |
 | `payload` | JSONB | Event data |
+| `created_at` | TIMESTAMP | Row creation time (defaults to `NOW()`) |
 | `published_at` | TIMESTAMP | NULL = pending delivery to Kafka |
 
 ---
@@ -223,18 +234,18 @@ venv\Scripts\activate          # Windows
 ### 3. Install Dependencies
 
 ```bash
-pip install asyncpg aiokafka asyncio
+pip install asyncpg aiokafka
 ```
 
-> Depending on your database adapter preference, you may also need `psycopg2-binary` for the synchronous `WithdrawalService`.
+> `asyncio` is part of the Python standard library and does not need to be installed separately. Depending on your database adapter preference, you may also need `psycopg2-binary` to wire the synchronous `WithdrawalService` class to a real PostgreSQL connection.
 
 ### 4. Set Up PostgreSQL
 
 Start a local PostgreSQL instance and create a sandbox database:
 
 ```bash
-psql -U postgres -c "CREATE DATABASE custody_sandbox;"
-psql -U postgres -d custody_sandbox -f withdrawal.sql
+psql -U postgres -c "CREATE DATABASE custody;"
+psql -U postgres -d custody -f withdrawal.sql
 ```
 
 The SQL file will:
@@ -254,22 +265,13 @@ docker run -d --name kafka \
 
 ### 6. Run the Outbox Publisher
 
-```python
-import asyncio
-import asyncpg
-from aiokafka import AIOKafkaProducer
-from outbox_publisher import OutboxPublisher
+The publisher has a built-in entry point that connects to PostgreSQL (`localhost/custody`) and Kafka (`localhost:9092`):
 
-async def main():
-    pool = await asyncpg.create_pool("postgresql://postgres@localhost/custody_sandbox")
-    producer = AIOKafkaProducer(bootstrap_servers="localhost:9092")
-    await producer.start()
-
-    publisher = OutboxPublisher(db=pool, kafka_producer=producer)
-    await publisher.run_forever(poll_interval=1)
-
-asyncio.run(main())
+```bash
+python outbox-publisher.py
 ```
+
+It will poll `outbox_events` in a loop and deliver unpublished events to Kafka. Press `Ctrl+C` to stop gracefully.
 
 ### 7. Exercise the Withdrawal Service
 
@@ -308,7 +310,17 @@ service.process_withdrawal(
 )
 ```
 
-### 8. Verify the Ledger State
+### 8. Run the Withdrawal Demo
+
+`withdrawal.py` includes a standalone async demo that exercises the withdrawal flow (idempotency check, address validation, atomic fund lock, and transaction creation) against a live PostgreSQL database:
+
+```bash
+python withdrawal.py
+```
+
+It connects to `postgresql://postgres@localhost/custody`, creates a test account with 10 ETH if needed, and walks through each step with detailed output.
+
+### 9. Verify the Ledger State
 
 Run this query in psql to confirm the final state after the SQL demo:
 
@@ -336,7 +348,8 @@ Crypto-Custody-Withdrawal-System-Python/
 │
 ├── withdrawal.py          # Core WithdrawalService — full withdrawal lifecycle
 ├── withdrawal.sql         # PostgreSQL schema + end-to-end sandbox demo
-└── outbox_publisher.py    # Async background poller — DB outbox → Kafka
+├── outbox-publisher.py    # Async background poller — DB outbox → Kafka
+└── LICENSE                # MIT License
 ```
 
 ---
@@ -363,7 +376,7 @@ Crypto-Custody-Withdrawal-System-Python/
 
 ## 📄 License
 
-This project is provided as-is for educational and reference purposes. Please review the repository's license file before use.
+This project is licensed under the [MIT License](LICENSE).
 
 ---
 
