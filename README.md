@@ -17,6 +17,7 @@
 - [Database Schema](#database-schema)
 - [Transaction State Machine](#transaction-state-machine)
 - [Running in a Sandbox Environment](#running-in-a-sandbox-environment)
+- [Docker Services](#docker-services)
 - [Project Structure](#project-structure)
 - [Production Warning](#production-warning)
 - [License](#license)
@@ -27,13 +28,16 @@
 
 The **Crypto Custody Withdrawal System** is a Python-based reference implementation that models the core backend logic of a **custodial cryptocurrency withdrawal pipeline** using **double-entry accounting**. It demonstrates how a financial platform can safely accept, validate, process, and confirm crypto withdrawal requests while maintaining a fully auditable, append-only ledger where balances are derived from journal entries rather than stored as mutable fields.
 
-This system is built around three tightly integrated components:
+The system is composed of seven containerized services orchestrated via Docker Compose:
 
-| Component | File | Responsibility |
+| Service | Directory | Responsibility |
 |---|---|---|
-| Withdrawal Service | `withdrawal.py` | Orchestrates the full withdrawal lifecycle with journal entries |
-| Database Schema & Demo | `withdrawal.sql` | Double-entry schema, triggers, views, and runnable walkthrough |
-| Outbox Publisher | `outbox-publisher.py` | Reliably delivers database events to Kafka |
+| Withdrawal Service | `withdrawal/` | Orchestrates the full withdrawal lifecycle with journal entries |
+| Outbox Publisher | `outbox/` | Reliably delivers database events to Kafka |
+| Signing Gateway | `signing-gateway/` | Fan-out MPC signing orchestrator |
+| MPC Nodes (x3) | `mpc/` | Threshold partial signature generation (stub) |
+| PostgreSQL | `db/init/` | Double-entry schema, triggers, views, and seed data |
+| Kafka + Zookeeper | (Docker images) | Event streaming infrastructure |
 
 ---
 
@@ -46,7 +50,7 @@ This system is built around three tightly integrated components:
   Client Request ------> |  1. Idempotency Check               |
                          |  2. Address Validation              |
                          |  3. Pessimistic Lock (account row)   |---> PostgreSQL
-                         |  4. Derive Balance (journal view)    |
+                         |  4. Derive Balance (journal view)    |     (internal network)
                          |  5. INSERT Transaction + Journal     |
                          |  6. Outbox Event (same transaction)  |
                          |  7. Policy Engine Evaluation         |---> PolicyEngine
@@ -57,7 +61,17 @@ This system is built around three tightly integrated components:
                          |          OutboxPublisher             |
                          |                                      |
   PostgreSQL Outbox ---> |  Poll unpublished events             |---> Kafka Topics
-   (background loop)     |  Mark published atomically           |
+   (background loop)     |  Mark published atomically           |     (backend network)
+                         |  (readonly DB user)                  |
+                         +--------------------------------------+
+
+                         +--------------------------------------+
+                         |         SigningGateway                |
+                         |                                      |
+  Signing Request ------>|  Fan-out to MPC nodes (parallel)     |
+                         |  Collect partial signatures          |---> MPC Nodes x3
+                         |  Threshold check (majority)          |     (signing network)
+                         |  Assemble combined signature         |
                          +--------------------------------------+
 
                          +--------------------------------------+
@@ -68,6 +82,18 @@ This system is built around three tightly integrated components:
                          |  INSERT status history (confirmed)   |
                          +--------------------------------------+
 ```
+
+### Network Isolation
+
+Three Docker networks enforce trust boundaries:
+
+| Network | Visibility | Services |
+|---|---|---|
+| `backend` | Inter-service | Withdrawal, Outbox, Kafka, Zookeeper, Signing Gateway |
+| `internal` | Database only | PostgreSQL, Withdrawal, Outbox |
+| `signing` | MPC only | Signing Gateway, MPC Nodes 1-3 |
+
+PostgreSQL is completely isolated from the host and from signing infrastructure. MPC nodes are unreachable from anything except the signing gateway.
 
 ---
 
@@ -89,13 +115,16 @@ The account row is locked with `SELECT ... FOR UPDATE` inside an atomic database
 The transaction record, journal entries, status history, and outbox event are all written in a **single atomic database transaction**. If the application crashes after writing but before publishing to Kafka, the outbox poller will still deliver the event.
 
 ### Reliable Event Delivery via Async Outbox Publisher
-The `OutboxPublisher` runs as a background loop, polling `outbox_events` for undelivered messages. It uses `FOR UPDATE SKIP LOCKED` to allow multiple publisher replicas to run safely in parallel.
+The `OutboxPublisher` runs as a background loop, polling `outbox_events` for undelivered messages. It uses `FOR UPDATE SKIP LOCKED` to allow multiple publisher replicas to run safely in parallel. The publisher connects with a least-privilege database user that can only `SELECT` on `outbox_events` and `UPDATE` the `published_at` column.
 
 ### Policy Engine Integration
 Before a withdrawal is forwarded to signing, it is evaluated by an external **policy engine**. If rejected, a reversal journal pair restores the customer balance and a `REJECTED` status is appended to the history.
 
 ### FIFO Signing Queue with Per-Account Ordering
 Approved withdrawals are published to a **FIFO message queue** using the account ID as the `MessageGroupId`, guaranteeing per-account ordering in the downstream signing service.
+
+### MPC Signing Gateway
+A signing gateway fans out signing requests to three MPC nodes in parallel over an isolated Docker network. It collects partial signatures and requires a majority threshold (t-of-n) before assembling the combined signature. The current implementation uses deterministic stubs (SHA-256 hashes) rather than real threshold-ECDSA.
 
 ### Derived Balances via Views
 The `account_balances` view computes balances from journal entries. The `transaction_current_status` view returns the latest status per transaction using `DISTINCT ON`. No mutable state is queried for balance checks.
@@ -189,7 +218,7 @@ Identity-only record. No mutable balance columns --- serves as a lock target for
 | `id` | UUID | Primary key |
 | `user_id` | UUID | Owning user |
 | `asset` | VARCHAR(10) | e.g. `ETH`, `BTC` |
-| `created_at` | TIMESTAMP | Row creation time |
+| `created_at` | TIMESTAMPTZ | Row creation time |
 
 ### `chart_of_accounts`
 Reference data for ledger categories.
@@ -215,7 +244,7 @@ Append-only double-entry ledger. Each row is one leg of a balanced pair.
 | `credit` | DECIMAL(38,18) | Credit amount (0 if debit leg) |
 | `entry_type` | VARCHAR(32) | e.g. `deposit`, `withdrawal_initiation` |
 | `reference_id` | UUID | Transaction or entity this entry relates to |
-| `created_at` | TIMESTAMP | Row creation time |
+| `created_at` | TIMESTAMPTZ | Row creation time |
 
 > CHECK constraint: each row must have exactly one of debit or credit > 0.
 
@@ -231,7 +260,7 @@ Immutable transaction record. No `status`, `tx_hash`, or `block_number` columns.
 | `destination_address` | VARCHAR(256) | Target crypto address |
 | `idempotency_key` | VARCHAR(256) UNIQUE | Deduplication key |
 | `policy_check_result` | JSONB | Result from policy engine evaluation |
-| `created_at` | TIMESTAMP | Row creation time |
+| `created_at` | TIMESTAMPTZ | Row creation time |
 
 ### `transaction_status_history`
 Append-only status transitions. Latest row per `transaction_id` is the current status.
@@ -244,7 +273,7 @@ Append-only status transitions. Latest row per `transaction_id` is the current s
 | `tx_hash` | VARCHAR(256) | On-chain hash (set on confirmation) |
 | `block_number` | BIGINT | Block number (set on confirmation) |
 | `metadata` | JSONB | Additional context |
-| `created_at` | TIMESTAMP | Row creation time |
+| `created_at` | TIMESTAMPTZ | Row creation time |
 
 ### `outbox_events`
 Reliable event delivery buffer (unchanged).
@@ -255,8 +284,8 @@ Reliable event delivery buffer (unchanged).
 | `aggregate_id` | VARCHAR(256) | Transaction ID (Kafka key / ordering) |
 | `event_type` | VARCHAR(64) | e.g. `withdrawal.pending_policy` |
 | `payload` | JSONB | Event data |
-| `created_at` | TIMESTAMP | Row creation time (defaults to `NOW()`) |
-| `published_at` | TIMESTAMP | NULL = pending delivery to Kafka |
+| `created_at` | TIMESTAMPTZ | Row creation time (defaults to `NOW()`) |
+| `published_at` | TIMESTAMPTZ | NULL = pending delivery to Kafka |
 
 ### Views
 
@@ -317,134 +346,158 @@ Status transitions are recorded as INSERT-only rows in `transaction_status_histo
 
 ### Prerequisites
 
-- Python 3.10+
-- PostgreSQL 14+
-- A Kafka instance (local or Docker)
-- Optional: AWS SQS FIFO (or a local mock like ElasticMQ)
+- Docker and Docker Compose
 
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/pavondunbar/Crypto-Custody-Withdrawal-System-Python.git
-cd Crypto-Custody-Withdrawal-System-Python
+git clone https://github.com/pavondunbar/CC-PYTHON.git
+cd CC-PYTHON
 ```
 
-### 2. Create a Virtual Environment
+### 2. Start All Services
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate       # macOS/Linux
-venv\Scripts\activate          # Windows
+docker-compose up -d
 ```
 
-### 3. Install Dependencies
+This starts all seven services: PostgreSQL, Zookeeper, Kafka, Withdrawal Service, Outbox Publisher, Signing Gateway, and three MPC nodes. The database schema is automatically initialized from `db/init/`.
+
+### 3. Run the Withdrawal Demo
+
+The withdrawal service runs its demo automatically on startup. Check the output:
 
 ```bash
-pip install asyncpg aiokafka
+docker-compose logs withdrawal-service
 ```
 
-> `asyncio` is part of the Python standard library. Depending on your database adapter preference, you may also need `psycopg2-binary` to wire the synchronous `WithdrawalService` class to a real PostgreSQL connection.
+The demo seeds the chart of accounts, creates a test account, records a 10 ETH deposit via journal entries, and walks through the full withdrawal lifecycle with derived balance verification at each step.
 
-### 4. Set Up PostgreSQL
-
-Start a local PostgreSQL instance and create a sandbox database:
+To run the demo again:
 
 ```bash
-psql -U postgres -c "CREATE DATABASE custody;"
-psql -U postgres -d custody -f withdrawal.sql
+docker-compose run withdrawal-service python withdrawal.py
 ```
 
-The SQL file will:
-- Create all tables (accounts, chart_of_accounts, journal_entries, transactions, transaction_status_history, outbox_events)
-- Create views (account_balances, transaction_current_status)
-- Install append-only triggers and the journal balance constraint trigger
-- Seed the chart of accounts
-- Run a complete double-entry withdrawal lifecycle (deposit, initiation, confirmation)
-- Print derived balances at each step for verification
+### 4. Publish Outbox Events to Kafka
 
-### 5. Start a Local Kafka (Docker)
+The outbox publisher runs continuously as a background poller. Check its status:
 
 ```bash
-docker run -d --name kafka \
-  -p 9092:9092 \
-  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
-  apache/kafka:latest
+docker-compose logs outbox-publisher
 ```
 
-### 6. Run the Outbox Publisher
+### 5. Verify the Ledger
+
+Query derived balances directly via the PostgreSQL container:
 
 ```bash
-python outbox-publisher.py
-```
-
-It will poll `outbox_events` in a loop and deliver unpublished events to Kafka. Press `Ctrl+C` to stop gracefully.
-
-### 7. Run the Withdrawal Demo
-
-```bash
-python withdrawal.py
-```
-
-The demo connects to `postgresql://postgres@localhost/custody`, seeds the chart of accounts, creates a test account, records a 10 ETH deposit via journal entry, and walks through the full withdrawal lifecycle with derived balance verification at each step.
-
-### 8. Verify the Ledger
-
-Run this query in psql to confirm derived balances:
-
-```sql
-SELECT * FROM account_balances;
+docker-compose exec postgres psql -U ledger_user -d ledger_db \
+  -c "SELECT * FROM account_balances;"
 ```
 
 To see the full journal:
 
-```sql
-SELECT
-  journal_id,
-  coa_code,
-  debit,
-  credit,
-  entry_type,
-  created_at
-FROM journal_entries
-ORDER BY created_at, coa_code;
+```bash
+docker-compose exec postgres psql -U ledger_user -d ledger_db -c "
+  SELECT journal_id, coa_code, debit, credit, entry_type, created_at
+  FROM journal_entries
+  ORDER BY created_at, coa_code;
+"
 ```
 
-To verify append-only enforcement:
+To verify append-only enforcement (both should raise exceptions):
 
-```sql
--- Both of these should raise exceptions:
-UPDATE journal_entries SET debit = 0 WHERE id = (SELECT id FROM journal_entries LIMIT 1);
-DELETE FROM journal_entries WHERE id = (SELECT id FROM journal_entries LIMIT 1);
+```bash
+docker-compose exec postgres psql -U ledger_user -d ledger_db -c "
+  UPDATE journal_entries SET debit = 0
+  WHERE id = (SELECT id FROM journal_entries LIMIT 1);
+"
 ```
 
-To verify balanced journal constraint:
+### 6. Inspect Kafka Topics
 
-```sql
--- This should fail at COMMIT:
-BEGIN;
-INSERT INTO journal_entries
-  (journal_id, account_id, coa_code, asset, debit, credit,
-   entry_type, reference_id)
-VALUES
-  (gen_random_uuid(),
-   (SELECT id FROM accounts LIMIT 1),
-   'HOT_WALLET', 'ETH', 50, 0,
-   'test_unbalanced',
-   gen_random_uuid());
-COMMIT;
+List all topics:
+
+```bash
+docker-compose exec kafka kafka-topics \
+  --bootstrap-server localhost:9092 --list
 ```
+
+Consume messages from a topic:
+
+```bash
+docker-compose exec kafka kafka-console-consumer \
+  --bootstrap-server localhost:9092 \
+  --topic custody.withdrawal.confirmed \
+  --from-beginning --timeout-ms 5000
+```
+
+### 7. Test the Signing Gateway
+
+Send a signing request to the gateway:
+
+```bash
+docker-compose exec signing-gateway python -c "
+import aiohttp, asyncio, json
+async def test():
+    async with aiohttp.ClientSession() as s:
+        async with s.post('http://localhost:8000/sign',
+            json={'tx_id': 'test-123', 'payload': 'deadbeef'}) as r:
+            print(json.dumps(await r.json(), indent=2))
+asyncio.run(test())
+"
+```
+
+### 8. Clean Restart
+
+To tear down everything and start fresh (removes database volume):
+
+```bash
+docker-compose down -v
+docker-compose up -d
+```
+
+---
+
+## Docker Services
+
+| Container | Image | Networks | Role |
+|---|---|---|---|
+| `ledger-db` | postgres:15 | internal | Double-entry ledger database |
+| `withdrawal-service` | ./withdrawal | backend, internal | Withdrawal lifecycle orchestration |
+| `outbox-publisher` | ./outbox | backend, internal | Outbox event delivery to Kafka |
+| `kafka` | cp-kafka:7.5.0 | backend | Event streaming broker |
+| `zookeeper` | cp-zookeeper:7.5.0 | backend | Kafka coordination |
+| `signing-gateway` | ./signing-gateway | backend, signing | Fan-out MPC signing orchestrator |
+| `mpc-node-{1,2,3}` | ./mpc | signing | Threshold partial signature nodes |
+
+All custom services use **Python 3.13-slim** base images. The database volume (`postgres_data`) persists data across restarts. Use `docker-compose down -v` to reset.
 
 ---
 
 ## Project Structure
 
 ```
-Crypto-Custody-Withdrawal-System-Python/
-|
-|-- withdrawal.py          # WithdrawalService with double-entry journal entries
-|-- withdrawal.sql         # PostgreSQL double-entry schema + demo walkthrough
-|-- outbox-publisher.py    # Async background poller: DB outbox -> Kafka
-+-- LICENSE                # MIT License
+CC-PYTHON/
+├── db/
+│   └── init/
+│       ├── 001-schema.sql           # Double-entry schema, triggers, views, seed data
+│       └── 002-readonly-user.sql    # Least-privilege DB user for outbox publisher
+├── withdrawal/
+│   ├── Dockerfile
+│   └── withdrawal.py                # WithdrawalService with double-entry journal entries
+├── outbox/
+│   ├── Dockerfile
+│   └── outbox-publisher.py          # Async background poller: DB outbox -> Kafka
+├── signing-gateway/
+│   ├── Dockerfile
+│   └── gateway.py                   # Fan-out MPC signing orchestrator
+├── mpc/
+│   ├── Dockerfile
+│   └── node.py                      # MPC node stub (deterministic signing)
+├── docker-compose.yaml              # Full service orchestration (7 services, 3 networks)
+└── LICENSE                          # MIT License
 ```
 
 ---
@@ -455,13 +508,14 @@ Crypto-Custody-Withdrawal-System-Python/
 
 | Missing Component | Risk if Absent |
 |---|---|
-| HSM / MPC key signing | Private keys would be exposed in software |
+| Real MPC / threshold-ECDSA | Signing gateway uses deterministic stubs, not real cryptography |
 | Real address validation | Funds could be sent to invalid/malicious addresses |
 | AML / KYC policy engine | Regulatory violations, sanctions exposure |
 | Authentication & authorization | Any caller could initiate withdrawals |
 | Rate limiting & withdrawal limits | Accounts could be drained rapidly |
-| Secrets management | Database credentials exposed |
+| Secrets management | Database credentials passed via environment variables |
 | Retry logic with dead-letter queues | Failed messages silently dropped |
+| TLS / mTLS between services | Inter-service traffic is unencrypted |
 | Security audit | Unknown vulnerabilities |
 | Comprehensive test suite | Untested edge cases in fund handling |
 

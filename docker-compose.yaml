@@ -1,0 +1,132 @@
+services:
+  # 🏦 Postgres (LEDGER - HIGH TRUST, HARDENED)
+  postgres:
+    image: postgres:15
+    container_name: ledger-db
+    restart: always
+    environment:
+      POSTGRES_USER: ledger_user
+      POSTGRES_PASSWORD: ledger_pass
+      POSTGRES_DB: ledger_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d
+    networks:
+      - internal
+    # ❌ No ports exposed → not reachable from host
+
+  # 🔐 Withdrawal Service (ONLY WRITER)
+  withdrawal-service:
+    build: ./withdrawal
+    container_name: withdrawal-service
+    depends_on:
+      - postgres
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ledger_db
+      DB_USER: ledger_user
+      DB_PASSWORD: ledger_pass
+    networks:
+      - backend
+      - internal
+    restart: on-failure
+
+  # 📦 Outbox Publisher (READ-ONLY)
+  outbox-publisher:
+    build: ./outbox
+    container_name: outbox-publisher
+    depends_on:
+      - postgres
+      - kafka
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ledger_db
+      DB_USER: readonly_user
+      DB_PASSWORD: readonly_pass
+      KAFKA_BROKER: kafka:9092
+    networks:
+      - backend
+      - internal
+    restart: on-failure
+
+  # 🧠 Zookeeper
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks:
+      - backend
+
+  # 📨 Kafka
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - backend
+    restart: always
+
+  # 🚪 Signing Gateway (ONLY ENTRY INTO SIGNING DOMAIN)
+  signing-gateway:
+    build: ./signing-gateway
+    container_name: signing-gateway
+    depends_on:
+      - mpc-node-1
+      - mpc-node-2
+      - mpc-node-3
+    environment:
+      MPC_NODES: "mpc-node-1:8001,mpc-node-2:8001,mpc-node-3:8001"
+    networks:
+      - backend     # receives requests
+      - signing     # talks to MPC nodes
+    restart: on-failure
+
+  # 🔑 MPC Node 1
+  mpc-node-1:
+    build: ./mpc
+    container_name: mpc-node-1
+    environment:
+      NODE_ID: 1
+    networks:
+      - signing
+    restart: on-failure
+
+  # 🔑 MPC Node 2
+  mpc-node-2:
+    build: ./mpc
+    container_name: mpc-node-2
+    environment:
+      NODE_ID: 2
+    networks:
+      - signing
+    restart: on-failure
+
+  # 🔑 MPC Node 3
+  mpc-node-3:
+    build: ./mpc
+    container_name: mpc-node-3
+    environment:
+      NODE_ID: 3
+    networks:
+      - signing
+    restart: on-failure
+
+networks:
+  backend:
+  internal:
+    internal: true   # 🔴 DB is private
+  signing:
+    internal: true   # 🔴 MPC is isolated
+
+volumes:
+  postgres_data:

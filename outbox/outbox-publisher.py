@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 
 import asyncpg
 from aiokafka import AIOKafkaProducer
@@ -68,11 +69,20 @@ class OutboxPublisher:
 
 
 async def main():
-    pool = await asyncpg.create_pool(
-        "postgresql://postgres@localhost/custody",
+    db_host = os.environ.get("DB_HOST", "localhost")
+    db_port = os.environ.get("DB_PORT", "5432")
+    db_name = os.environ.get("DB_NAME", "ledger_db")
+    db_user = os.environ.get("DB_USER", "readonly_user")
+    db_pass = os.environ.get("DB_PASSWORD", "")
+    dsn = (
+        f"postgresql://{db_user}:{db_pass}"
+        f"@{db_host}:{db_port}/{db_name}"
     )
+    kafka_broker = os.environ.get("KAFKA_BROKER", "localhost:9092")
+
+    pool = await asyncpg.create_pool(dsn)
     producer = AIOKafkaProducer(
-        bootstrap_servers="localhost:9092",
+        bootstrap_servers=kafka_broker,
     )
     try:
         await producer.start()

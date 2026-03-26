@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -236,7 +237,12 @@ class WithdrawalService:
 
 
 async def main():
-    dsn = "postgresql://postgres@localhost/custody"
+    db_host = os.environ.get("DB_HOST", "localhost")
+    db_port = os.environ.get("DB_PORT", "5432")
+    db_name = os.environ.get("DB_NAME", "ledger_db")
+    db_user = os.environ.get("DB_USER", "ledger_user")
+    db_pass = os.environ.get("DB_PASSWORD", "")
+    dsn = f"postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
     conn = await asyncpg.connect(dsn)
 
     user_id = uuid.UUID(
