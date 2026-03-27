@@ -13,6 +13,12 @@ services:
       - ./db/init:/docker-entrypoint-initdb.d
     networks:
       - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger_user -d ledger_db"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
     # ❌ No ports exposed → not reachable from host
 
   # 🔐 Withdrawal Service (ONLY WRITER)
@@ -20,7 +26,8 @@ services:
     build: ./withdrawal
     container_name: withdrawal-service
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
@@ -37,8 +44,10 @@ services:
     build: ./outbox
     container_name: outbox-publisher
     depends_on:
-      - postgres
-      - kafka
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
     environment:
       DB_HOST: postgres
       DB_PORT: 5432

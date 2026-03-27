@@ -80,18 +80,41 @@ async def main():
     )
     kafka_broker = os.environ.get("KAFKA_BROKER", "localhost:9092")
 
-    pool = await asyncpg.create_pool(dsn)
+    max_retries = 10
+    retry_delay = 2
+    pool = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            pool = await asyncpg.create_pool(dsn)
+            break
+        except (OSError, asyncpg.PostgresError) as exc:
+            if attempt == max_retries:
+                raise
+            print(
+                f"[DB] Connection attempt {attempt}/{max_retries}"
+                f" failed: {exc}. Retrying in {retry_delay}s..."
+            )
+            await asyncio.sleep(retry_delay)
+
     producer = AIOKafkaProducer(
         bootstrap_servers=kafka_broker,
     )
-    try:
-        await producer.start()
-    except Exception as e:
-        await pool.close()
-        raise SystemExit(
-            f"Failed to connect to Kafka: {e}\n"
-            "Ensure Kafka is running on localhost:9092."
-        )
+    for attempt in range(1, max_retries + 1):
+        try:
+            await producer.start()
+            break
+        except Exception as exc:
+            if attempt == max_retries:
+                await pool.close()
+                raise SystemExit(
+                    f"Failed to connect to Kafka: {exc}\n"
+                    "Ensure Kafka is running."
+                )
+            print(
+                f"[Kafka] Connection attempt {attempt}/{max_retries}"
+                f" failed: {exc}. Retrying in {retry_delay}s..."
+            )
+            await asyncio.sleep(retry_delay)
 
     publisher = OutboxPublisher(db=pool, kafka_producer=producer)
     print("OutboxPublisher started — polling for events…")

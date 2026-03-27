@@ -243,7 +243,21 @@ async def main():
     db_user = os.environ.get("DB_USER", "ledger_user")
     db_pass = os.environ.get("DB_PASSWORD", "")
     dsn = f"postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
-    conn = await asyncpg.connect(dsn)
+    max_retries = 10
+    retry_delay = 2
+    conn = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            conn = await asyncpg.connect(dsn)
+            break
+        except (OSError, asyncpg.PostgresError) as exc:
+            if attempt == max_retries:
+                raise
+            print(
+                f"[DB] Connection attempt {attempt}/{max_retries}"
+                f" failed: {exc}. Retrying in {retry_delay}s..."
+            )
+            await asyncio.sleep(retry_delay)
 
     user_id = uuid.UUID(
         "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
