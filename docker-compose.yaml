@@ -130,6 +130,47 @@ services:
       - signing
     restart: on-failure
 
+  # 🔍 Reconciliation Engine (READ-ONLY, INTERNAL ONLY)
+  reconciliation:
+    build: ./reconciliation
+    container_name: reconciliation
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ledger_db
+      DB_USER: readonly_user
+      DB_PASSWORD: readonly_pass
+      RECON_INTERVAL: 60
+      RECON_MODE: reconcile
+    networks:
+      - internal
+    restart: on-failure
+
+  # 📡 Event Consumer (READS KAFKA, WRITES AUDIT)
+  event-consumer:
+    build: ./event-consumer
+    container_name: event-consumer
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ledger_db
+      DB_USER: readonly_user
+      DB_PASSWORD: readonly_pass
+      KAFKA_BROKER: kafka:9092
+      GATEWAY_URL: http://signing-gateway:8000
+    networks:
+      - backend
+      - internal
+    restart: on-failure
+
 networks:
   backend:
   internal:

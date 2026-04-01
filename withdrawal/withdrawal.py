@@ -8,6 +8,12 @@ from enum import Enum
 
 import asyncpg
 
+from rbac import (
+    check_permission,
+    insert_audit_event,
+    validate_transition,
+)
+
 
 class InvalidAddressError(Exception):
     """Raised when a destination address fails validation."""
@@ -64,7 +70,10 @@ class WithdrawalService:
                 "WHERE account_id = %s",
                 (account.id,)
             )
-            available = balance_row.balance if balance_row else Decimal(0)
+            available = (
+                balance_row.balance if balance_row
+                else Decimal(0)
+            )
             if available < amount:
                 raise InsufficientBalanceError()
 
@@ -140,7 +149,9 @@ class WithdrawalService:
 
         return tx
 
-    def _refund_and_reject(self, tx, account_id, asset, amount):
+    def _refund_and_reject(
+        self, tx, account_id, asset, amount
+    ):
         with self.db.transaction() as conn:
             self._insert_journal_pair(
                 conn, account_id, asset, amount,
@@ -236,45 +247,37 @@ class WithdrawalService:
         return True
 
 
-async def main():
+# --------------------------------------------------
+# Demo helper functions
+# --------------------------------------------------
+
+async def connect_db():
+    """Connect to Postgres with retry logic."""
     db_host = os.environ.get("DB_HOST", "localhost")
     db_port = os.environ.get("DB_PORT", "5432")
     db_name = os.environ.get("DB_NAME", "ledger_db")
     db_user = os.environ.get("DB_USER", "ledger_user")
     db_pass = os.environ.get("DB_PASSWORD", "")
-    dsn = f"postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
+    dsn = (
+        f"postgresql://{db_user}:{db_pass}"
+        f"@{db_host}:{db_port}/{db_name}"
+    )
     max_retries = 10
-    retry_delay = 2
-    conn = None
     for attempt in range(1, max_retries + 1):
         try:
-            conn = await asyncpg.connect(dsn)
-            break
+            return await asyncpg.connect(dsn)
         except (OSError, asyncpg.PostgresError) as exc:
             if attempt == max_retries:
                 raise
             print(
-                f"[DB] Connection attempt {attempt}/{max_retries}"
-                f" failed: {exc}. Retrying in {retry_delay}s..."
+                f"[DB] Attempt {attempt}/{max_retries} "
+                f"failed: {exc}. Retrying..."
             )
-            await asyncio.sleep(retry_delay)
+            await asyncio.sleep(2)
 
-    user_id = uuid.UUID(
-        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-    )
-    asset = "ETH"
-    amount = Decimal("1.5")
-    destination = (
-        "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18"
-    )
-    idempotency_key = str(uuid.uuid4())
 
-    print("=" * 60)
-    print("Double-Entry Withdrawal Demo")
-    print("=" * 60)
-
-    # Seed chart of accounts (idempotent)
-    print("\n[Setup] Seeding chart of accounts...")
+async def seed_chart_of_accounts(conn):
+    """Idempotent seed of the chart of accounts."""
     for code, name, acct_type, normal in [
         ("CUST_LIABILITY", "Customer Liability",
          "liability", "credit"),
@@ -294,29 +297,32 @@ async def main():
         )
     print("  Chart of accounts ready.")
 
-    # Create account (identity only — no balance columns)
-    account = await conn.fetchrow(
+
+async def create_or_get_account(conn, user_id, asset):
+    """Return existing account_id or create a new one."""
+    row = await conn.fetchrow(
         "SELECT id FROM accounts "
         "WHERE user_id = $1 AND asset = $2",
         user_id, asset,
     )
-    if account is None:
-        account_id = uuid.uuid4()
-        await conn.execute(
-            "INSERT INTO accounts "
-            "(id, user_id, asset, created_at) "
-            "VALUES ($1, $2, $3, $4)",
-            account_id, user_id, asset,
-            datetime.now(tz=timezone.utc),
-        )
-        print(f"\n[Setup] Created account {account_id}")
-    else:
-        account_id = account["id"]
-        print(f"\n[Setup] Using existing account {account_id}")
+    if row:
+        print(f"  Using existing account {row['id']}")
+        return row["id"]
+    account_id = uuid.uuid4()
+    await conn.execute(
+        "INSERT INTO accounts "
+        "(id, user_id, asset, created_at) "
+        "VALUES ($1, $2, $3, $4)",
+        account_id, user_id, asset,
+        datetime.now(tz=timezone.utc),
+    )
+    print(f"  Created account {account_id}")
+    return account_id
 
-    # Deposit 10 ETH via journal entry
-    print("\n[Setup] Recording 10 ETH deposit...")
-    deposit_journal_id = uuid.uuid4()
+
+async def record_deposit(conn, account_id, asset, amount):
+    """Record a deposit via a balanced journal pair."""
+    journal_id = uuid.uuid4()
     now = datetime.now(tz=timezone.utc)
     async with conn.transaction():
         await conn.execute(
@@ -326,70 +332,49 @@ async def main():
             "created_at) VALUES "
             "($1, $2, $3, $4, $5, 0, $6, $7, $8), "
             "($1, $2, $9, $4, 0, $5, $6, $7, $8)",
-            deposit_journal_id, account_id,
-            "HOT_WALLET", asset, Decimal("10.0"),
+            journal_id, account_id,
+            "HOT_WALLET", asset, amount,
             "deposit", account_id, now,
             "CUST_LIABILITY",
         )
-
-    balance_row = await conn.fetchrow(
+    bal = await conn.fetchrow(
         "SELECT balance FROM account_balances "
         "WHERE account_id = $1",
         account_id,
     )
-    print(f"  Derived balance: {balance_row['balance']}")
+    print(f"  Deposited {amount} {asset}. "
+          f"Balance: {bal['balance']}")
 
-    # Step 1: Idempotency check
-    print("\n[Step 1] Idempotency check...")
-    existing = await conn.fetchrow(
-        "SELECT id FROM transactions "
-        "WHERE idempotency_key = $1",
-        idempotency_key,
-    )
-    if existing:
-        print(
-            f"  Duplicate — returning tx {existing['id']}"
-        )
-        await conn.close()
-        return
-    print("  No duplicate found.")
 
-    # Step 2: Address validation
-    print("\n[Step 2] Address validation...")
-    if not destination:
-        raise InvalidAddressError("Empty address")
-    print(f"  Address {destination} valid.")
-
-    # Step 3: Atomic withdrawal initiation
-    print("\n[Step 3] Atomic withdrawal initiation...")
+async def initiate_withdrawal(
+    conn, account_id, asset, amount,
+    destination, idempotency_key,
+    actor_role, actor_id, trace_id,
+):
+    """Atomically initiate a withdrawal with audit event."""
     tx_id = uuid.uuid4()
     outbox_id = uuid.uuid4()
     journal_id = uuid.uuid4()
+    request_id = uuid.uuid4()
     now = datetime.now(tz=timezone.utc)
 
     async with conn.transaction():
-        # Pessimistic lock on account row
-        locked = await conn.fetchrow(
+        await conn.fetchrow(
             "SELECT id FROM accounts "
             "WHERE id = $1 FOR UPDATE",
             account_id,
         )
-
-        # Derive balance from journal
         bal = await conn.fetchrow(
             "SELECT balance FROM account_balances "
             "WHERE account_id = $1",
             account_id,
         )
         available = bal["balance"] if bal else Decimal(0)
-        print(f"  Derived balance: {available}")
-
         if available < amount:
             raise InsufficientBalanceError(
                 f"Need {amount}, have {available}"
             )
 
-        # INSERT immutable transaction
         await conn.execute(
             "INSERT INTO transactions "
             "(id, account_id, type, amount, "
@@ -399,20 +384,20 @@ async def main():
             tx_id, account_id, "withdrawal", amount,
             destination, idempotency_key, now,
         )
-        print(f"  Created transaction {tx_id}")
-
-        # INSERT status history
         await conn.execute(
             "INSERT INTO transaction_status_history "
-            "(transaction_id, status, created_at) "
-            "VALUES ($1, $2, $3)",
+            "(transaction_id, status, metadata, "
+            "created_at) "
+            "VALUES ($1, $2, $3, $4)",
             tx_id,
             TransactionStatus.PENDING_POLICY.value,
+            json.dumps({
+                "actor_role": actor_role,
+                "actor_id": actor_id,
+                "trace_id": str(trace_id),
+            }),
             now,
         )
-
-        # INSERT journal pair:
-        # DEBIT CUST_LIABILITY, CREDIT WITHDRAWAL_PENDING
         await conn.execute(
             "INSERT INTO journal_entries "
             "(journal_id, account_id, coa_code, asset, "
@@ -425,17 +410,12 @@ async def main():
             "withdrawal_initiation", tx_id, now,
             "WITHDRAWAL_PENDING",
         )
-        print(
-            f"  Journal pair: DEBIT CUST_LIABILITY "
-            f"{amount}, CREDIT WITHDRAWAL_PENDING {amount}"
-        )
-
-        # INSERT outbox event
         payload = json.dumps({
             "transaction_id": str(tx_id),
             "asset": asset,
             "amount": str(amount),
             "destination": destination,
+            "trace_id": str(trace_id),
         })
         await conn.execute(
             "INSERT INTO outbox_events "
@@ -445,45 +425,87 @@ async def main():
             outbox_id, str(tx_id),
             "withdrawal.pending_policy", payload, now,
         )
-        print(f"  Outbox event {outbox_id}")
+        await insert_audit_event(
+            conn, actor_role, actor_id,
+            "withdrawal.initiated",
+            "transaction", tx_id,
+            request_id=request_id,
+            trace_id=trace_id,
+            metadata=json.dumps({
+                "amount": str(amount), "asset": asset,
+            }),
+        )
 
-    print("  Transaction committed.")
+    print(f"  Created tx {tx_id}, balance now {available - amount}")
+    return tx_id
 
-    # Step 4: Verify balance after initiation
-    print("\n[Step 4] Post-initiation state:")
-    bal = await conn.fetchrow(
-        "SELECT balance FROM account_balances "
-        "WHERE account_id = $1",
-        account_id,
-    )
-    print(f"  Derived balance: {bal['balance']}")
 
-    status = await conn.fetchrow(
+async def transition_status(
+    conn, tx_id, new_status,
+    actor_role, actor_id, trace_id,
+    tx_hash=None, block_number=None,
+):
+    """Transition status with audit event and outbox."""
+    current = await conn.fetchrow(
         "SELECT status FROM transaction_current_status "
         "WHERE transaction_id = $1",
         tx_id,
     )
-    print(f"  Transaction status: {status['status']}")
+    current_val = current["status"] if current else None
+    validate_transition(current_val, new_status)
 
-    # Step 5: Simulate on-chain confirmation
-    print("\n[Step 5] Confirming withdrawal on-chain...")
-    confirm_journal_id = uuid.uuid4()
-    confirm_outbox_id = uuid.uuid4()
     now = datetime.now(tz=timezone.utc)
-
     async with conn.transaction():
-        # INSERT status: confirmed
         await conn.execute(
             "INSERT INTO transaction_status_history "
             "(transaction_id, status, tx_hash, "
-            "block_number, created_at) "
-            "VALUES ($1, $2, $3, $4, $5)",
-            tx_id, TransactionStatus.CONFIRMED.value,
-            "0x123456...abcdef", 12345678, now,
+            "block_number, metadata, created_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            tx_id, new_status,
+            tx_hash, block_number,
+            json.dumps({
+                "actor_role": actor_role,
+                "actor_id": actor_id,
+                "trace_id": str(trace_id),
+            }),
+            now,
         )
+        payload = {
+            "transaction_id": str(tx_id),
+            "status": new_status,
+            "trace_id": str(trace_id),
+        }
+        if tx_hash:
+            payload["tx_hash"] = tx_hash
+        if block_number is not None:
+            payload["block_number"] = str(block_number)
+        await conn.execute(
+            "INSERT INTO outbox_events "
+            "(id, aggregate_id, event_type, "
+            "payload, created_at) "
+            "VALUES ($1, $2, $3, $4, $5)",
+            uuid.uuid4(), str(tx_id),
+            f"withdrawal.{new_status}",
+            json.dumps(payload), now,
+        )
+        await insert_audit_event(
+            conn, actor_role, actor_id,
+            f"withdrawal.{new_status}",
+            "transaction", tx_id,
+            trace_id=trace_id,
+            metadata=json.dumps(payload),
+        )
+    print(f"  {current_val} -> {new_status}")
 
-        # INSERT journal pair:
-        # DEBIT WITHDRAWAL_PENDING, CREDIT HOT_WALLET
+
+async def confirm_on_chain(
+    conn, tx_id, account_id, asset, amount,
+    tx_hash, block_number, trace_id,
+):
+    """Settlement journal pair + confirmed status."""
+    journal_id = uuid.uuid4()
+    now = datetime.now(tz=timezone.utc)
+    async with conn.transaction():
         await conn.execute(
             "INSERT INTO journal_entries "
             "(journal_id, account_id, coa_code, asset, "
@@ -491,34 +513,136 @@ async def main():
             "created_at) VALUES "
             "($1, $2, $3, $4, $5, 0, $6, $7, $8), "
             "($1, $2, $9, $4, 0, $5, $6, $7, $8)",
-            confirm_journal_id, account_id,
+            journal_id, account_id,
             "WITHDRAWAL_PENDING", asset, amount,
             "withdrawal_settlement", tx_id, now,
             "HOT_WALLET",
         )
+    await transition_status(
+        conn, tx_id, TransactionStatus.CONFIRMED.value,
+        "system", "on-chain-tracker", trace_id,
+        tx_hash=tx_hash, block_number=block_number,
+    )
+
+
+async def run_inline_reconciliation(conn, account_id):
+    """Replay journal for one account, compare to view."""
+    rows = await conn.fetch(
+        "SELECT debit, credit FROM journal_entries "
+        "WHERE account_id = $1 AND coa_code = 'CUST_LIABILITY'",
+        account_id,
+    )
+    replayed = sum(
+        r["credit"] - r["debit"] for r in rows
+    )
+    view_row = await conn.fetchrow(
+        "SELECT balance FROM account_balances "
+        "WHERE account_id = $1",
+        account_id,
+    )
+    view_bal = view_row["balance"] if view_row else Decimal(0)
+    match = "PASS" if replayed == view_bal else "FAIL"
+    print(f"  Replayed={replayed}  View={view_bal}  [{match}]")
+    return replayed == view_bal
+
+
+async def print_audit_trail(conn, trace_id):
+    """Display all audit events for a trace."""
+    rows = await conn.fetch(
+        "SELECT action, actor_role, actor_id, "
+        "resource_id, created_at "
+        "FROM audit_events WHERE trace_id = $1 "
+        "ORDER BY created_at",
+        trace_id,
+    )
+    print(f"  Audit trail ({len(rows)} events):")
+    for r in rows:
         print(
-            f"  Journal pair: DEBIT WITHDRAWAL_PENDING "
-            f"{amount}, CREDIT HOT_WALLET {amount}"
+            f"    {r['action']:40s} "
+            f"by {r['actor_role']}/{r['actor_id']}  "
+            f"resource={r['resource_id']}"
         )
 
-        # INSERT outbox event
-        confirm_payload = json.dumps({
-            "transaction_id": str(tx_id),
-            "tx_hash": "0x123456...abcdef",
-            "block_number": "12345678",
-            "amount": str(amount),
-        })
-        await conn.execute(
-            "INSERT INTO outbox_events "
-            "(id, aggregate_id, event_type, "
-            "payload, created_at) "
-            "VALUES ($1, $2, $3, $4, $5)",
-            confirm_outbox_id, str(tx_id),
-            "withdrawal.confirmed",
-            confirm_payload, now,
-        )
 
-    print("  Confirmation committed.")
+async def main():
+    conn = await connect_db()
+
+    trace_id = uuid.uuid4()
+    user_id = uuid.UUID(
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    )
+    asset = "ETH"
+    amount = Decimal("1.5")
+    destination = (
+        "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18"
+    )
+    idempotency_key = str(uuid.uuid4())
+
+    print("=" * 60)
+    print("Double-Entry Withdrawal Demo (Full State Machine)")
+    print("=" * 60)
+
+    # Setup
+    print("\n[Setup] Seeding chart of accounts...")
+    await seed_chart_of_accounts(conn)
+
+    print("\n[Setup] Account...")
+    account_id = await create_or_get_account(
+        conn, user_id, asset
+    )
+
+    print("\n[Setup] Deposit 10 ETH...")
+    await record_deposit(
+        conn, account_id, asset, Decimal("10.0")
+    )
+
+    # RBAC check
+    print("\n[RBAC] Checking admin permission...")
+    check_permission("admin", "approve_withdrawal")
+    print("  admin has approve_withdrawal: OK")
+
+    roles = await conn.fetch("SELECT code, permissions FROM roles")
+    print(f"  Roles in DB: {len(roles)}")
+    for r in roles:
+        print(f"    {r['code']}: {r['permissions']}")
+
+    # Step 1: Initiate (PENDING_POLICY)
+    print("\n[Step 1] Initiate withdrawal...")
+    tx_id = await initiate_withdrawal(
+        conn, account_id, asset, amount,
+        destination, idempotency_key,
+        actor_role="admin",
+        actor_id="user-alice",
+        trace_id=trace_id,
+    )
+
+    # Step 2: Approve (PENDING_POLICY -> APPROVED)
+    print("\n[Step 2] Approve withdrawal...")
+    await transition_status(
+        conn, tx_id, TransactionStatus.APPROVED.value,
+        "admin", "policy-engine", trace_id,
+    )
+
+    # Step 3: Sign (APPROVED -> SIGNED)
+    print("\n[Step 3] Sign withdrawal...")
+    await transition_status(
+        conn, tx_id, TransactionStatus.SIGNED.value,
+        "signer", "mpc-cluster", trace_id,
+    )
+
+    # Step 4: Broadcast (SIGNED -> BROADCAST)
+    print("\n[Step 4] Broadcast withdrawal...")
+    await transition_status(
+        conn, tx_id, TransactionStatus.BROADCAST.value,
+        "system", "broadcaster", trace_id,
+    )
+
+    # Step 5: Confirm on-chain (BROADCAST -> CONFIRMED)
+    print("\n[Step 5] Confirm on-chain...")
+    await confirm_on_chain(
+        conn, tx_id, account_id, asset, amount,
+        "0xabc123...def456", 19_500_000, trace_id,
+    )
 
     # Step 6: Final state
     print("\n[Step 6] Final state:")
@@ -539,6 +663,7 @@ async def main():
     print(f"  tx_hash:      {status['tx_hash']}")
     print(f"  block_number: {status['block_number']}")
 
+    # Journal entries
     entries = await conn.fetch(
         "SELECT coa_code, debit, credit, entry_type "
         "FROM journal_entries "
@@ -558,6 +683,7 @@ async def main():
             f"{e['coa_code']:25s} {side}"
         )
 
+    # Outbox events
     events = await conn.fetch(
         "SELECT event_type, published_at "
         "FROM outbox_events ORDER BY created_at"
@@ -565,11 +691,24 @@ async def main():
     print(f"\n  Outbox events ({len(events)}):")
     for ev in events:
         pub = ev["published_at"] or "not yet"
-        print(f"    {ev['event_type']:35s} published: {pub}")
+        print(
+            f"    {ev['event_type']:35s} "
+            f"published: {pub}"
+        )
+
+    # Inline reconciliation
+    print("\n[Step 7] Inline reconciliation:")
+    await run_inline_reconciliation(conn, account_id)
+
+    # Audit trail
+    print(f"\n[Step 8] Audit trail (trace={trace_id}):")
+    await print_audit_trail(conn, trace_id)
 
     print("\n" + "=" * 60)
-    print("Done. All balances derived from journal entries.")
-    print("Run outbox-publisher.py to deliver events to Kafka.")
+    print("Done. Full state machine exercised:")
+    print("  PENDING_POLICY -> APPROVED -> SIGNED "
+          "-> BROADCAST -> CONFIRMED")
+    print("All balances derived from journal entries.")
     print("=" * 60)
 
     await conn.close()

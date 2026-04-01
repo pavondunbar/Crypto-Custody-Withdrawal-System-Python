@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import os
+from datetime import datetime, timezone
 
 import asyncpg
 from aiokafka import AIOKafkaProducer
@@ -11,16 +13,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+MAX_RETRIES_PER_EVENT = 5
+
+
 class OutboxPublisher:
     def __init__(self, db, kafka_producer, batch_size=100):
         self.db = db
         self.kafka = kafka_producer
         self.batch_size = batch_size
+        self._retry_counts = {}
+
+    async def _move_to_dlq(self, conn, event_id, error_msg):
+        """Move a permanently failed event to the DLQ."""
+        await conn.execute(
+            "INSERT INTO dead_letter_queue "
+            "(original_event_id, error_message, "
+            "retry_count, max_retries, last_retry_at) "
+            "VALUES ($1, $2, $3, $4, $5)",
+            event_id,
+            error_msg,
+            MAX_RETRIES_PER_EVENT,
+            MAX_RETRIES_PER_EVENT,
+            datetime.now(tz=timezone.utc),
+        )
+        await conn.execute(
+            "UPDATE outbox_events "
+            "SET published_at = NOW() "
+            "WHERE id = $1",
+            event_id,
+        )
+        self._retry_counts.pop(event_id, None)
+        logger.error(
+            "Event %s moved to DLQ after %d retries: %s",
+            event_id, MAX_RETRIES_PER_EVENT, error_msg,
+        )
 
     async def poll_and_publish(self):
         async with self.db.acquire() as conn:
             events = await conn.fetch(
-                "SELECT id, aggregate_id, event_type, payload "
+                "SELECT id, aggregate_id, event_type, "
+                "payload "
                 "FROM outbox_events "
                 "WHERE published_at IS NULL "
                 "ORDER BY created_at "
@@ -32,25 +64,44 @@ class OutboxPublisher:
             if not events:
                 return
 
-            logger.info("Found %d unpublished event(s)", len(events))
+            logger.info(
+                "Found %d unpublished event(s)", len(events)
+            )
 
             for event in events:
                 topic = f"custody.{event['event_type']}"
                 payload = event["payload"]
                 if not isinstance(payload, str):
-                    import json
                     payload = json.dumps(payload)
 
-                await self.kafka.send(
-                    topic=topic,
-                    key=event["aggregate_id"].encode(),
-                    value=payload.encode(),
-                )
+                try:
+                    await self.kafka.send(
+                        topic=topic,
+                        key=event["aggregate_id"].encode(),
+                        value=payload.encode(),
+                    )
+                except Exception as exc:
+                    eid = event["id"]
+                    count = self._retry_counts.get(eid, 0) + 1
+                    self._retry_counts[eid] = count
+                    if count >= MAX_RETRIES_PER_EVENT:
+                        await self._move_to_dlq(
+                            conn, eid, str(exc)
+                        )
+                    else:
+                        logger.warning(
+                            "Kafka send failed for %s "
+                            "(attempt %d/%d): %s",
+                            eid, count,
+                            MAX_RETRIES_PER_EVENT, exc,
+                        )
+                    continue
+
                 logger.info(
                     "Published event %s -> %s",
-                    event["id"],
-                    topic,
+                    event["id"], topic,
                 )
+                self._retry_counts.pop(event["id"], None)
 
                 await conn.execute(
                     "UPDATE outbox_events "
@@ -63,8 +114,8 @@ class OutboxPublisher:
         while True:
             try:
                 await self.poll_and_publish()
-            except Exception as e:
-                logger.error("Outbox poll failed: %s", e)
+            except Exception as exc:
+                logger.error("Outbox poll failed: %s", exc)
             await asyncio.sleep(poll_interval)
 
 
@@ -98,6 +149,8 @@ async def main():
 
     producer = AIOKafkaProducer(
         bootstrap_servers=kafka_broker,
+        acks="all",
+        enable_idempotence=True,
     )
     for attempt in range(1, max_retries + 1):
         try:

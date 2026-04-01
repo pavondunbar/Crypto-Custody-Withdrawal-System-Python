@@ -4,7 +4,6 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir asyncpg
 
-COPY rbac.py .
-COPY withdrawal.py .
+COPY reconciler.py .
 
-CMD ["python", "withdrawal.py"]
+CMD ["python", "reconciler.py"]
