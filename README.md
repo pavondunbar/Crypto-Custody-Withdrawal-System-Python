@@ -1,4 +1,6 @@
-# Crypto Custody Withdrawal System (Python)
+# Crypto Custody Withdrawal System
+
+<img width="1536" height="1024" alt="4d927272-a067-4c9f-bc4c-814ea3e7d3a7" src="https://github.com/user-attachments/assets/29d5854e-05d5-42d8-a074-fd0d479c5f46" />
 
 > **SANDBOX / EDUCATIONAL USE ONLY --- NOT FOR PRODUCTION**
 > This codebase is a reference implementation designed for learning, prototyping, and architectural exploration. It is **not audited, not hardened, and must not be used to handle real funds or deployed to a production environment.** See the [Production Warning](#production-warning) section for full details.
