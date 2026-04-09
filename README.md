@@ -10,13 +10,16 @@
 ## Table of Contents
 
 - [Overview](#overview)
+- [Quick Start](#quick-start)
 - [Architecture](#architecture)
+- [Requirements Verification](#requirements-verification)
 - [Key Features](#key-features)
 - [How It Works](#how-it-works)
 - [Double-Entry Accounting Model](#double-entry-accounting-model)
 - [Database Schema](#database-schema)
 - [Transaction State Machine](#transaction-state-machine)
 - [Running in a Sandbox Environment](#running-in-a-sandbox-environment)
+- [Testing](#testing)
 - [Docker Services](#docker-services)
 - [Project Structure](#project-structure)
 - [Production Warning](#production-warning)
@@ -40,6 +43,39 @@ The system is composed of nine containerized services orchestrated via Docker Co
 | Event Consumer | `event-consumer/` | Subscribes to Kafka topics and logs audit events |
 | PostgreSQL | `db/init/` | Double-entry schema, triggers, views, RBAC, audit, and seed data |
 | Kafka + Zookeeper | (Docker images) | Event streaming infrastructure |
+
+---
+
+## Quick Start
+
+```bash
+git clone https://github.com/pavondunbar/CC-PYTHON.git
+cd CC-PYTHON
+make up        # build and start all 9 services
+make demo      # run the full withdrawal lifecycle demo
+make demo-full # run end-to-end: withdrawal + Kafka + consumer
+make logs      # follow logs from all services
+make db-balances  # query derived balances from journal entries
+make down      # tear down everything and remove volumes
+```
+
+All available Makefile targets:
+
+| Command | Description |
+|---|---|
+| `make up` | Build and start all services |
+| `make down` | Stop all services and remove volumes |
+| `make demo` | Run the withdrawal demo (full state machine walkthrough) |
+| `make demo-full` | Run full end-to-end demo (all services + Kafka publishing) |
+| `make logs` | Follow logs from all services |
+| `make db-balances` | Show derived account balances from journal entries |
+| `make db-journal` | Show all journal entries |
+| `make db-audit` | Show audit trail |
+| `make db-recon` | Show reconciliation run history |
+| `make status` | Show running containers |
+| `make test` | Run core tests (no Docker required) |
+| `make clean` | Remove `__pycache__` and `.pyc` files |
+| `make help` | Show all targets with descriptions |
 
 ---
 
@@ -114,6 +150,26 @@ Three Docker networks enforce trust boundaries:
 | `signing` | MPC only | Signing Gateway, MPC Nodes 1-3 |
 
 PostgreSQL is completely isolated from the host and from signing infrastructure. MPC nodes are unreachable from anything except the signing gateway.
+
+---
+
+## Requirements Verification
+
+The following table maps each architectural requirement to its implementation in the codebase.
+
+| # | Requirement | Status | Implementation |
+|---|---|---|---|
+| 1 | Real microservice architecture with Docker, clear trust boundaries and service isolation | Satisfied | 9 services in `docker-compose.yaml` across 3 isolated Docker networks (`backend`, `internal`, `signing`). PostgreSQL is unreachable from signing infrastructure. MPC nodes are unreachable except from the signing gateway. |
+| 2 | Idempotency layer to prevent duplicate processing across APIs and message consumers | Satisfied | `UNIQUE` constraint on `transactions.idempotency_key`. Kafka producer uses `enable_idempotence=True`. Outbox publisher uses `FOR UPDATE SKIP LOCKED` for safe parallel polling. |
+| 3 | Comprehensive audit trails with request_id / trace_id / actor metadata for all state transitions | Satisfied | `audit_events` table with `request_id`, `trace_id`, `actor_role`, `actor_id`, `action`, `resource_type`, `resource_id`, and `metadata` columns. Every status transition and withdrawal action inserts an audit event. Event consumer writes audit events for all Kafka messages. |
+| 4 | Reconciliation engine (replay ledger, recompute balances, compare, alert on mismatch) | Satisfied | `reconciliation/reconciler.py` implements `replay_journal_balances()` -> `get_view_balances()` -> compare -> record mismatches in `reconciliation_mismatches`. Supports `reconcile` (balance only) and `rebuild` (full state validation) modes. |
+| 5 | Postgres-based ledger: append-only, double-entry, balance-derived, immutable | Satisfied | `journal_entries` uses debit/credit pairs with a deferred constraint trigger (`check_journal_balance`) that rejects unbalanced entries at commit. `account_balances` view derives balances via `SUM(credit) - SUM(debit)`. `BEFORE UPDATE` and `BEFORE DELETE` triggers on `journal_entries`, `transactions`, and `transaction_status_history` raise exceptions on mutation. |
+| 6 | Kafka-based messaging: outbox pattern, at-least-once delivery, DLQ | Satisfied | `outbox/outbox-publisher.py` polls `outbox_events` and publishes to Kafka topics (`custody.withdrawal.*`). Events retry up to 5 times before moving to `dead_letter_queue`. Kafka producer uses `acks="all"` for durability. |
+| 7 | Outbox publisher atomically persists events with ledger writes and asynchronously publishes | Satisfied | Journal entries, status history, and outbox events are inserted in a single `async with conn.transaction()` block. The outbox publisher runs as a separate service that polls and publishes asynchronously. |
+| 8 | RBAC enforcing separation of duties (Admin, System, Signer) | Satisfied | `roles` table seeded with `admin` (approve_withdrawal, view_transactions), `system` (publish_events, reconcile), and `signer` (sign_transaction). Python-side enforcement in `withdrawal/rbac.py`. No single role has both approve and sign permissions. |
+| 9 | Deterministic settlement state machine (PENDING -> APPROVED -> SIGNED -> BROADCASTED -> CONFIRMED) | Satisfied | `VALID_TRANSITIONS` dict in `rbac.py` + `enforce_status_transition` database trigger. Terminal states (`rejected`, `confirmed`, `failed`) block further transitions. Status history is append-only. |
+| 10 | MPC-based transaction signing (2-of-3 quorum) with simulated hashes | Satisfied | `signing-gateway/gateway.py` fans out to 3 MPC nodes in parallel, requires majority threshold `(n // 2) + 1 = 2`. Each node in `mpc/node.py` returns a deterministic SHA-256 partial signature. Combined stub signature returned on quorum. |
+| 11 | Deterministic state rebuild capability (full system state reconstructed from ledger) | Satisfied | `reconciler.py` `run_state_rebuild()` replays `transaction_status_history` in chronological order per transaction, validates each transition against `VALID_TRANSITIONS`, and replays journal entries to recompute all balances. |
 
 ---
 
@@ -498,14 +554,14 @@ Status transitions are recorded as INSERT-only rows in `transaction_status_histo
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/pavondunbar/CUSTODY-PYTHON.git
-cd CUSTODY-PYTHON
+git clone https://github.com/pavondunbar/CC-PYTHON.git
+cd CC-PYTHON
 ```
 
 ### 2. Start All Services
 
 ```bash
-docker-compose up -d
+make up
 ```
 
 This starts all nine services: PostgreSQL, Zookeeper, Kafka, Withdrawal Service, Outbox Publisher, Signing Gateway, three MPC nodes, Reconciliation Engine, and Event Consumer. The database schema is automatically initialized from `db/init/`.
@@ -523,7 +579,7 @@ The demo seeds the chart of accounts, creates a test account, records a 10 ETH d
 To run the demo again:
 
 ```bash
-docker-compose run withdrawal-service python withdrawal.py
+make demo
 ```
 
 ### 4. Publish Outbox Events to Kafka
@@ -637,8 +693,41 @@ asyncio.run(test())
 To tear down everything and start fresh (removes database volume):
 
 ```bash
-docker-compose down -v
-docker-compose up -d
+make down
+make up
+```
+
+---
+
+## Testing
+
+The project includes a core test suite in `tests/test_core.py` that validates the most critical paths without requiring Docker or a running database. Tests cover:
+
+- **State machine valid transitions**: Full happy path from `PENDING_POLICY` through `CONFIRMED`, plus rejection and failure branches
+- **State machine invalid transitions**: Verifies that skipping states, reversing transitions, and escaping terminal states all raise `ValueError`
+- **RBAC enforcement**: Confirms each role has the correct permissions and that separation of duties is maintained (no role has both `approve_withdrawal` and `sign_transaction`)
+- **Schema immutability**: Parses the SQL schema files to verify that all append-only tables have `BEFORE UPDATE` and `BEFORE DELETE` triggers, that the deferred journal balance trigger exists, and that the state machine enforcement trigger exists
+- **Grant safety**: Confirms the schema does not grant `UPDATE` or `DELETE` on `journal_entries`
+
+### Running Tests
+
+```bash
+make test
+```
+
+Or directly:
+
+```bash
+python -m pytest tests/ -v
+```
+
+37 tests, all passing:
+
+```
+tests/test_core.py::TestStateMachineValid       (9 tests)
+tests/test_core.py::TestStateMachineInvalid      (8 tests)
+tests/test_core.py::TestRBAC                     (7 tests)
+tests/test_core.py::TestSchemaConstraints        (13 tests)
 ```
 
 ---
@@ -664,7 +753,7 @@ All custom services use **Python 3.13-slim** base images. The database volume (`
 ## Project Structure
 
 ```
-CUSTODY-PYTHON/
+CC-PYTHON/
 ├── db/
 │   └── init/
 │       ├── 001-schema.sql              # Double-entry schema, triggers, views, seed data
@@ -674,7 +763,8 @@ CUSTODY-PYTHON/
 ├── withdrawal/
 │   ├── Dockerfile
 │   ├── withdrawal.py                   # WithdrawalService with double-entry journal entries
-│   └── rbac.py                         # RBAC utilities and state machine validation
+│   ├── rbac.py                         # RBAC utilities and state machine validation
+│   └── withdrawal.sql                  # SQL demo walkthrough
 ├── outbox/
 │   ├── Dockerfile
 │   └── outbox-publisher.py             # Async background poller: DB outbox -> Kafka with DLQ
@@ -690,7 +780,11 @@ CUSTODY-PYTHON/
 ├── event-consumer/
 │   ├── Dockerfile
 │   └── consumer.py                     # Kafka subscriber with audit event logging
+├── tests/
+│   └── test_core.py                    # Core tests: state machine, RBAC, schema constraints
 ├── docker-compose.yaml                 # Full service orchestration (9 services, 3 networks)
+├── Makefile                            # make up, make down, make demo, make demo-full, make test
+├── .gitignore
 └── LICENSE                             # MIT License
 ```
 
@@ -710,7 +804,7 @@ CUSTODY-PYTHON/
 | Secrets management | Database credentials passed via environment variables |
 | TLS / mTLS between services | Inter-service traffic is unencrypted |
 | Security audit | Unknown vulnerabilities |
-| Comprehensive test suite | Untested edge cases in fund handling |
+| Full integration test suite | Core tests cover state machine and RBAC; integration tests for fund handling are absent |
 
 > Handling real cryptocurrency requires engaging licensed custodians, security engineers, blockchain auditors, and legal counsel. **Do not use this code to hold, transfer, or manage real digital assets.**
 

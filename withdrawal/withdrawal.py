@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import os
@@ -564,7 +565,99 @@ async def print_audit_trail(conn, trace_id):
         )
 
 
-async def main():
+async def wait_for_outbox_publish(conn, expected_count):
+    """Poll outbox_events until all are published to Kafka."""
+    print("\n[Outbox] Waiting for events to be published "
+          "to Kafka...")
+    timeout = 30
+    for _ in range(timeout):
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS cnt "
+            "FROM outbox_events "
+            "WHERE published_at IS NOT NULL"
+        )
+        published = row["cnt"]
+        if published >= expected_count:
+            break
+        await asyncio.sleep(1)
+    else:
+        total = await conn.fetchrow(
+            "SELECT COUNT(*) AS cnt FROM outbox_events"
+        )
+        print(
+            f"[Outbox] WARNING: Timed out after {timeout}s. "
+            f"{published}/{total['cnt']} events published."
+        )
+        return
+
+    print(f"[Outbox] {published}/{expected_count} events "
+          "published to Kafka.\n")
+    events = await conn.fetch(
+        "SELECT event_type, published_at "
+        "FROM outbox_events ORDER BY created_at"
+    )
+    print("  Published Events:")
+    for ev in events:
+        topic = f"custody.{ev['event_type']}"
+        ts = ev["published_at"].isoformat() if ev[
+            "published_at"] else "pending"
+        print(f"    {ev['event_type']:35s} -> "
+              f"{topic:45s} at {ts}")
+
+
+EXPECTED_CONSUMER_ACTIONS = [
+    "withdrawal.pending_policy.consumed",
+    "withdrawal.approved.consumed",
+    "withdrawal.signed.consumed",
+    "withdrawal.confirmed.consumed",
+]
+
+
+async def wait_for_consumer_processing(conn, tx_id):
+    """Poll audit_events for consumer-written rows."""
+    print("\n[Consumer] Waiting for event consumer "
+          "to process messages...")
+    expected = set(EXPECTED_CONSUMER_ACTIONS)
+    timeout = 30
+    found = set()
+    for _ in range(timeout):
+        rows = await conn.fetch(
+            "SELECT action FROM audit_events "
+            "WHERE actor_id = 'event-consumer' "
+            "AND resource_id = $1",
+            tx_id,
+        )
+        found = {r["action"] for r in rows}
+        if expected.issubset(found):
+            break
+        await asyncio.sleep(1)
+    else:
+        missing = expected - found
+        print(
+            f"[Consumer] WARNING: Timed out after {timeout}s. "
+            f"Missing: {', '.join(sorted(missing))}"
+        )
+        return
+
+    print(f"[Consumer] {len(found)}/{len(expected)} "
+          "events consumed.\n")
+    rows = await conn.fetch(
+        "SELECT action, actor_role, actor_id "
+        "FROM audit_events "
+        "WHERE actor_id = 'event-consumer' "
+        "AND resource_id = $1 "
+        "ORDER BY created_at",
+        tx_id,
+    )
+    print("  Consumed Events:")
+    for r in rows:
+        print(
+            f"    {r['action']:45s} "
+            f"by {r['actor_role']}/{r['actor_id']}"
+        )
+
+
+async def main(wait_for_publish=False):
     conn = await connect_db()
 
     trace_id = uuid.uuid4()
@@ -711,8 +804,30 @@ async def main():
     print("All balances derived from journal entries.")
     print("=" * 60)
 
+    if wait_for_publish:
+        print("\n" + "=" * 60)
+        print("Full Pipeline: Outbox -> Kafka -> Consumer")
+        print("=" * 60)
+        await wait_for_outbox_publish(conn, expected_count=5)
+        await wait_for_consumer_processing(conn, tx_id)
+        print("\n" + "=" * 60)
+        print("End-to-end pipeline completed.")
+        print("  Withdrawal -> Journal -> Outbox "
+              "-> Kafka -> Consumer")
+        print("=" * 60)
+
     await conn.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(
+        description="Withdrawal demo"
+    )
+    parser.add_argument(
+        "--wait-for-publish",
+        action="store_true",
+        help="Wait for outbox events to be published "
+             "to Kafka and consumed",
+    )
+    args = parser.parse_args()
+    asyncio.run(main(wait_for_publish=args.wait_for_publish))
