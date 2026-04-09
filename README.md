@@ -816,4 +816,4 @@ This project is licensed under the [MIT License](LICENSE).
 
 ---
 
-*Built by [Pavon Dunbar](https://linktr.ee/pavondunbar)*
+*Built with ❤️ by [Pavon Dunbar](https://linktr.ee/pavondunbar)*
