@@ -65,14 +65,23 @@ All available Makefile targets:
 |---|---|
 | `make up` | Build and start all services |
 | `make down` | Stop all services and remove volumes |
+| `make build` | Build all images without starting services |
+| `make restart` | Restart all services without rebuilding |
 | `make demo` | Run the withdrawal demo (full state machine walkthrough) |
 | `make demo-full` | Run full end-to-end demo (all services + Kafka publishing) |
 | `make logs` | Follow logs from all services |
+| `make ps` | Show running containers |
+| `make status` | Show running containers |
+| `make health` | Check health of PostgreSQL, signing gateway, and MPC nodes |
+| `make integrity` | Verify ledger integrity (balanced journals, orphan check, DLQ) |
+| `make shell-pg` | Open interactive psql shell in PostgreSQL |
+| `make shell-kafka` | Open bash shell in the Kafka container |
+| `make topics` | List all Kafka topics |
+| `make kafka-tail` | Tail messages from all `custody.withdrawal.*` topics |
 | `make db-balances` | Show derived account balances from journal entries |
 | `make db-journal` | Show all journal entries |
 | `make db-audit` | Show audit trail |
 | `make db-recon` | Show reconciliation run history |
-| `make status` | Show running containers |
 | `make test` | Run core tests (no Docker required) |
 | `make clean` | Remove `__pycache__` and `.pyc` files |
 | `make help` | Show all targets with descriptions |
@@ -783,7 +792,7 @@ CC-PYTHON/
 ├── tests/
 │   └── test_core.py                    # Core tests: state machine, RBAC, schema constraints
 ├── docker-compose.yaml                 # Full service orchestration (9 services, 3 networks)
-├── Makefile                            # make up, make down, make demo, make demo-full, make test
+├── Makefile                            # 21 targets: lifecycle, debug, db queries, Kafka, tests
 ├── .gitignore
 └── LICENSE                             # MIT License
 ```
